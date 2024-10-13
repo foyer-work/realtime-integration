@@ -1,4 +1,4 @@
-import { DurableObject } from "cloudflare:workers";
+import { DurableObject } from 'cloudflare:workers';
 
 /**
  * Welcome to Cloudflare Workers! This is your first Durable Objects application.
@@ -58,7 +58,13 @@ export default {
 
 		// We call the `sayHello()` RPC method on the stub to invoke the method on the remote
 		// Durable Object instance
-		let greeting = await stub.sayHello("world");
+		let greeting = await stub.sayHello('world');
+
+		console.log({
+			id,
+			stub,
+			greeting,
+		});
 
 		return new Response(greeting);
 	},
