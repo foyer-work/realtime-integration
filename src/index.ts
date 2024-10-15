@@ -1,5 +1,20 @@
 import { DurableObject } from 'cloudflare:workers';
 
+type UsageOpenAI = {
+	total_tokens: number;
+	input_tokens: number;
+	output_tokens: number;
+	input_token_details: {
+		cached_tokens: number;
+		text_tokens: number;
+		audio_tokens: number;
+	};
+	output_token_details: {
+		text_tokens: number;
+		audio_tokens: number;
+	};
+};
+
 // Worker
 export default {
 	async fetch(request, env, ctx): Promise<Response> {
@@ -10,7 +25,8 @@ export default {
 				return new Response('Durable Object expected Upgrade: websocket', { status: 426 });
 			}
 
-			const accessToken = request.headers.get('Authorization');
+			// use this for arcane
+			const accessToken = url.searchParams.get('token');
 			console.log({ accessToken });
 			const id = env.CONVERSATIONS.idFromName(`conversation-${accessToken}`);
 			const conversationDO = env.CONVERSATIONS.get(id);
@@ -33,6 +49,11 @@ export class ConversationDO extends DurableObject {
 	messageQueue: (string | ArrayBuffer)[];
 	openAIClient: WebSocket | null;
 	workerSocket: WebSocket | null;
+	usageOpenAI: UsageOpenAI[];
+	conversations: {
+		role: 'user' | 'assistant';
+		transcript: string;
+	}[];
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -40,6 +61,8 @@ export class ConversationDO extends DurableObject {
 		this.openAIClient = null;
 		this.workerSocket = null;
 		this.messageQueue = [];
+		this.conversations = [];
+		this.usageOpenAI = [];
 	}
 
 	fetch() {
@@ -63,7 +86,6 @@ export class ConversationDO extends DurableObject {
 		workerWs.addEventListener('message', (event) => {
 			/**
 			 * Send the message to OpenAI
-			 * Store message in DurableObject state
 			 */
 
 			if (!this.openAIClient || this.openAIClient.readyState !== WebSocket.OPEN) {
@@ -77,11 +99,11 @@ export class ConversationDO extends DurableObject {
 			/**
 			 * Close the openAI socket
 			 * Store the conversation to the database (Arcane)
-			 * Close the workerWs socket
 			 */
 
 			// await this.dumpConversationToArcane()
 			if (this.openAIClient && this.openAIClient.readyState === WebSocket.OPEN) {
+				console.log({ usageOpenAI: this.usageOpenAI, conversations: this.conversations });
 				console.log('[ConversationDO] Worker/Client closed the connection.');
 				this.openAIClient.close();
 			}
@@ -106,6 +128,27 @@ export class ConversationDO extends DurableObject {
 		openAIClient.addEventListener('message', (event) => {
 			if (this.workerSocket && this.workerSocket.readyState === WebSocket.OPEN) {
 				this.workerSocket.send(event.data);
+				const evt = JSON.parse(event.data.toString());
+
+				switch (evt.type) {
+					case 'response.done':
+						this.usageOpenAI.push(evt.response.usage);
+						break;
+					case 'conversation.item.input_audio_transcription.completed':
+						this.conversations.push({
+							role: 'user',
+							transcript: evt.transcript,
+						});
+						break;
+					case 'response.audio_transcript.done':
+						this.conversations.push({
+							role: 'assistant',
+							transcript: evt.transcript,
+						});
+						break;
+					default:
+						break;
+				}
 			}
 		});
 
