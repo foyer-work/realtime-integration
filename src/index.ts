@@ -39,73 +39,63 @@ export default {
 		if (url.pathname === '/websocket') {
 			const upgradeHeader = request.headers.get('Upgrade');
 			if (!upgradeHeader || upgradeHeader !== 'websocket') {
-				return new Response('Durable Object expected Upgrade: websocket', { status: 426 });
+				return new Response('Expected Upgrade: websocket', { status: 426 });
 			}
 
-			// use this for arcane
 			const accessToken = url.searchParams.get('token');
-			console.log({ accessToken });
+			if (!accessToken) {
+				return new Response('Missing access token', { status: 400 });
+			}
+
 			const id = env.CONVERSATIONS.idFromName(`conversation-${accessToken}`);
 			const conversationDO = env.CONVERSATIONS.get(id);
 			return conversationDO.fetch(request.clone());
 		}
 
-		return new Response(null, {
-			status: 400,
-			statusText: 'Bad Request',
-			headers: {
-				'Content-Type': 'text/plain',
-			},
-		});
+		return new Response('Not Found', { status: 404 });
 	},
 } satisfies ExportedHandler<Env>;
 
 // Durable Object
 export class ConversationDO extends DurableObject {
 	env: Env;
-	messageQueue: (string | ArrayBuffer)[];
-	openAIClient: WebSocket | null;
-	workerSocket: WebSocket | null;
-	usageOpenAI: TUsageOpenAI;
+	messageQueue: (string | ArrayBuffer)[] = [];
+	openAIClient: WebSocket | null = null;
+	workerSocket: WebSocket | null = null;
+	usageOpenAI: TUsageOpenAI = {
+		total_tokens: 0,
+		input_tokens: 0,
+		output_tokens: 0,
+		cost: {
+			input: 0,
+			output: 0,
+		},
+	};
 	conversations: {
 		role: 'user' | 'assistant';
 		transcript: string;
-	}[];
-	feature: TRealtimeVoiceChatFeature;
+	}[] = [];
+	feature: TRealtimeVoiceChatFeature = {
+		usage: 0,
+		resetsAt: 2147452200000,
+		limit: 0,
+		costPerToken: {
+			input: 0.001,
+			output: 0.002,
+		},
+	};
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.env = env;
-		this.openAIClient = null;
-		this.workerSocket = null;
-		this.messageQueue = [];
-		this.conversations = [];
-		this.usageOpenAI = {
-			total_tokens: 0,
-			input_tokens: 0,
-			output_tokens: 0,
-			cost: {
-				input: 0,
-				output: 0,
-			},
-		};
-		this.feature = {
-			usage: 0,
-			resetsAt: 2147452200000,
-			limit: 0,
-			costPerToken: {
-				input: 0.001,
-				output: 0.002,
-			},
-		};
 	}
 
-	fetch(request: Request) {
+	async fetch(request: Request) {
 		const webSocketPair = new WebSocketPair();
 		const [client, server] = Object.values(webSocketPair);
 
-		const accessToken = new URL(request.url).searchParams.get('token');
-		this.handleSession(server, accessToken);
+		const accessToken = new URL(request.url).searchParams.get('token') || '';
+		await this.handleSession(server, accessToken);
 
 		return new Response(null, {
 			status: 101,
@@ -113,14 +103,9 @@ export class ConversationDO extends DurableObject {
 		});
 	}
 
-	async handleSession(workerWs: WebSocket, accessToken: string | null) {
+	async handleSession(workerWs: WebSocket, accessToken: string) {
 		workerWs.accept();
 		this.workerSocket = workerWs;
-
-		if (!accessToken) {
-			this.closeWithError(workerWs, 'No access token provided.');
-			return;
-		}
 
 		let clientError = { errorType: 'Unknown', message: 'Unexpected Error occured' };
 		try {
@@ -139,7 +124,7 @@ export class ConversationDO extends DurableObject {
 				}
 				const logMessage = `Error verifying user: ${JSON.stringify(body)}`;
 
-				this.closeWithError(workerWs, logMessage, clientError);
+				this.sendErrorAndClose(workerWs, logMessage, clientError);
 				return;
 			} else if ('realtimeVoiceChat' in body.data) {
 				this.feature = body.data.realtimeVoiceChat;
@@ -148,106 +133,111 @@ export class ConversationDO extends DurableObject {
 			this.openAIClient = this.connectToOpenAI();
 		} catch (error) {
 			const logMessage = `Error verifying user: ${JSON.stringify(error)}`;
-			this.closeWithError(workerWs, logMessage, clientError);
+			this.sendErrorAndClose(workerWs, logMessage, clientError);
+			return;
 		}
 
-		workerWs.addEventListener('message', (event) => {
-			/**
-			 * Send the message to OpenAI
-			 */
+		workerWs.addEventListener('message', this.handleWorkerMessage.bind(this));
+		workerWs.addEventListener('close', this.handleWorkerClose.bind(this));
+		return true;
+	}
 
-			console.log({
-				inputEventToOpenAI: event.data,
+	handleWorkerMessage(event: MessageEvent) {
+		if (!this.openAIClient || this.openAIClient.readyState !== WebSocket.OPEN) {
+			this.messageQueue.push(event.data);
+			return;
+		}
+
+		if (this.isUsageLimitReached()) {
+			this.sendErrorAndClose(this.workerSocket!, 'Usage limit reached.', {
+				errorType: 'UsageLimitReached',
+				message: 'Usage limit reached.',
 			});
-			if (!this.openAIClient || this.openAIClient.readyState !== WebSocket.OPEN) {
-				this.messageQueue.push(event.data);
-			} else {
-				if (this.usageOpenAI.cost.input + this.usageOpenAI.cost.output + this.feature.usage >= this.feature.limit) {
-					this.closeWithError(workerWs, 'Usage limit reached.', {
-						errorType: 'UsageLimitReached',
-						message: 'Usage limit reached.',
-					});
-					return;
-				}
-				this.openAIClient.send(event.data);
-			}
-		});
+			return;
+		}
 
-		workerWs.addEventListener('close', () => {
-			/**
-			 * Close the openAI socket
-			 * Store the conversation to the database (Arcane)
-			 */
+		this.openAIClient.send(event.data);
+	}
 
-			// await this.dumpConversationToArcane()
-			if (this.openAIClient && this.openAIClient.readyState === WebSocket.OPEN) {
-				console.log({ usageOpenAI: this.usageOpenAI, conversations: this.conversations });
-				this.closeWithError(this.openAIClient, 'Worker/Client closed the connection.');
-			}
-		});
+	handleWorkerClose() {
+		// await this.dumpConversationToArcane()
+		if (this.openAIClient && this.openAIClient.readyState === WebSocket.OPEN) {
+			console.log({ usageOpenAI: this.usageOpenAI, conversations: this.conversations });
+			this.sendErrorAndClose(this.openAIClient, 'Worker/Client closed the connection.');
+		}
 	}
 
 	connectToOpenAI() {
 		const url = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01';
 		const openAIClient = new WebSocket(url, ['realtime', `openai-insecure-api-key.${this.env.OPENAI_API_KEY}`, 'openai-beta.realtime-v1']);
 
-		openAIClient.addEventListener('open', () => {
-			console.log('Connected to OpenAI server.');
-
-			while (this.messageQueue.length > 0) {
-				const message = this.messageQueue.shift();
-				if (message) {
-					openAIClient.send(message);
-				}
-			}
-		});
-
-		openAIClient.addEventListener('message', (event) => {
-			if (this.workerSocket && this.workerSocket.readyState === WebSocket.OPEN) {
-				this.workerSocket.send(event.data);
-				const evt = JSON.parse(event.data.toString());
-
-				switch (evt.type) {
-					case 'response.done':
-						const { total_tokens, input_tokens, output_tokens } = evt.response.usage;
-						this.usageOpenAI = {
-							total_tokens: this.usageOpenAI.total_tokens + total_tokens,
-							input_tokens: this.usageOpenAI.input_tokens + input_tokens,
-							output_tokens: this.usageOpenAI.output_tokens + output_tokens,
-							cost: {
-								input: (this.usageOpenAI.input_tokens + input_tokens) * this.feature.costPerToken.input,
-								output: (this.usageOpenAI.output_tokens + output_tokens) * this.feature.costPerToken.output,
-							},
-						};
-						break;
-					case 'conversation.item.input_audio_transcription.completed':
-						this.conversations.push({
-							role: 'user',
-							transcript: evt.transcript,
-						});
-						break;
-					case 'response.audio_transcript.done':
-						this.conversations.push({
-							role: 'assistant',
-							transcript: evt.transcript,
-						});
-						break;
-					default:
-						break;
-				}
-			}
-		});
-
-		openAIClient.addEventListener('close', () => {
-			if (this.workerSocket && this.workerSocket.readyState === WebSocket.OPEN) {
-				this.closeWithError(this.workerSocket, 'OpenAI server closed the connection.');
-			}
-		});
+		openAIClient.addEventListener('open', this.handleOpenAIOpen.bind(this));
+		openAIClient.addEventListener('message', this.handleOpenAIMessage.bind(this));
+		openAIClient.addEventListener('close', this.handleOpenAIClose.bind(this));
 
 		return openAIClient;
 	}
 
-	closeWithError(
+	handleOpenAIOpen() {
+		console.log('Connected to OpenAI server.');
+
+		while (this.messageQueue.length > 0) {
+			const message = this.messageQueue.shift();
+			if (message) {
+				this.openAIClient!.send(message);
+			}
+		}
+	}
+
+	handleOpenAIMessage(event: MessageEvent) {
+		if (this.workerSocket && this.workerSocket.readyState === WebSocket.OPEN) {
+			this.workerSocket.send(event.data);
+			const evt = JSON.parse(event.data.toString());
+
+			switch (evt.type) {
+				case 'response.done':
+					const { total_tokens, input_tokens, output_tokens } = evt.response.usage;
+					this.updateUsage({ total_tokens, input_tokens, output_tokens });
+					break;
+				case 'conversation.item.input_audio_transcription.completed':
+					this.conversations.push({
+						role: 'user',
+						transcript: evt.transcript,
+					});
+					break;
+				case 'response.audio_transcript.done':
+					this.conversations.push({
+						role: 'assistant',
+						transcript: evt.transcript,
+					});
+					break;
+			}
+		}
+	}
+
+	handleOpenAIClose() {
+		if (this.workerSocket && this.workerSocket.readyState === WebSocket.OPEN) {
+			this.sendErrorAndClose(this.workerSocket, 'OpenAI server closed the connection.');
+		}
+	}
+
+	updateUsage({ total_tokens, input_tokens, output_tokens }: { total_tokens: number; input_tokens: number; output_tokens: number }) {
+		this.usageOpenAI = {
+			total_tokens: this.usageOpenAI.total_tokens + total_tokens,
+			input_tokens: this.usageOpenAI.input_tokens + input_tokens,
+			output_tokens: this.usageOpenAI.output_tokens + output_tokens,
+			cost: {
+				input: (this.usageOpenAI.input_tokens + input_tokens) * this.feature.costPerToken.input,
+				output: (this.usageOpenAI.output_tokens + output_tokens) * this.feature.costPerToken.output,
+			},
+		};
+	}
+
+	isUsageLimitReached() {
+		return this.usageOpenAI.cost.input + this.usageOpenAI.cost.output + this.feature.usage >= this.feature.limit;
+	}
+
+	sendErrorAndClose(
 		socket: WebSocket,
 		logMessage: string,
 		clientError?: {
