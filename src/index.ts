@@ -1,18 +1,35 @@
 import { DurableObject } from 'cloudflare:workers';
 
-type UsageOpenAI = {
+type TUsageOpenAI = {
 	total_tokens: number;
 	input_tokens: number;
 	output_tokens: number;
-	input_token_details: {
-		cached_tokens: number;
-		text_tokens: number;
-		audio_tokens: number;
+	cost: {
+		input: number;
+		output: number;
 	};
-	output_token_details: {
-		text_tokens: number;
-		audio_tokens: number;
+};
+
+type TRealtimeVoiceChatFeature = {
+	usage: number;
+	resetsAt: number;
+	limit: number;
+	costPerToken: {
+		input: number;
+		output: number;
 	};
+};
+
+type TApiResponse = {
+	status: string;
+	data:
+		| {
+				type: string;
+				message: string;
+		  }
+		| {
+				realtimeVoiceChat: TRealtimeVoiceChatFeature;
+		  };
 };
 
 // Worker
@@ -49,11 +66,12 @@ export class ConversationDO extends DurableObject {
 	messageQueue: (string | ArrayBuffer)[];
 	openAIClient: WebSocket | null;
 	workerSocket: WebSocket | null;
-	usageOpenAI: UsageOpenAI[];
+	usageOpenAI: TUsageOpenAI;
 	conversations: {
 		role: 'user' | 'assistant';
 		transcript: string;
 	}[];
+	feature: TRealtimeVoiceChatFeature;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -62,14 +80,32 @@ export class ConversationDO extends DurableObject {
 		this.workerSocket = null;
 		this.messageQueue = [];
 		this.conversations = [];
-		this.usageOpenAI = [];
+		this.usageOpenAI = {
+			total_tokens: 0,
+			input_tokens: 0,
+			output_tokens: 0,
+			cost: {
+				input: 0,
+				output: 0,
+			},
+		};
+		this.feature = {
+			usage: 0,
+			resetsAt: 2147452200000,
+			limit: 0,
+			costPerToken: {
+				input: 0.001,
+				output: 0.002,
+			},
+		};
 	}
 
-	fetch() {
+	fetch(request: Request) {
 		const webSocketPair = new WebSocketPair();
 		const [client, server] = Object.values(webSocketPair);
 
-		this.handleSession(server);
+		const accessToken = new URL(request.url).searchParams.get('token');
+		this.handleSession(server, accessToken);
 
 		return new Response(null, {
 			status: 101,
@@ -77,20 +113,62 @@ export class ConversationDO extends DurableObject {
 		});
 	}
 
-	handleSession(workerWs: WebSocket) {
+	async handleSession(workerWs: WebSocket, accessToken: string | null) {
 		workerWs.accept();
 		this.workerSocket = workerWs;
 
-		this.openAIClient = this.connectToOpenAI();
+		if (!accessToken) {
+			this.closeWithError(workerWs, 'No access token provided.');
+			return;
+		}
+
+		let clientError = { errorType: 'Unknown', message: 'Unexpected Error occured' };
+		try {
+			const verificationResponse = await fetch('http://localhost:8080/v1/user/realtime/user-verification', {
+				method: 'GET',
+				headers: {
+					Authorization: `Bearer ${accessToken}`,
+					'x-merlin-version': 'socket-merlin',
+				},
+			});
+
+			const body: TApiResponse = await verificationResponse.json();
+			if (!verificationResponse.ok) {
+				if ('type' in body.data) {
+					clientError = { errorType: body.data.type, message: body.data.message };
+				}
+				const logMessage = `Error verifying user: ${JSON.stringify(body)}`;
+
+				this.closeWithError(workerWs, logMessage, clientError);
+				return;
+			} else if ('realtimeVoiceChat' in body.data) {
+				this.feature = body.data.realtimeVoiceChat;
+			}
+
+			this.openAIClient = this.connectToOpenAI();
+		} catch (error) {
+			const logMessage = `Error verifying user: ${JSON.stringify(error)}`;
+			this.closeWithError(workerWs, logMessage, clientError);
+		}
 
 		workerWs.addEventListener('message', (event) => {
 			/**
 			 * Send the message to OpenAI
 			 */
 
+			console.log({
+				inputEventToOpenAI: event.data,
+			});
 			if (!this.openAIClient || this.openAIClient.readyState !== WebSocket.OPEN) {
 				this.messageQueue.push(event.data);
 			} else {
+				if (this.usageOpenAI.cost.input + this.usageOpenAI.cost.output + this.feature.usage >= this.feature.limit) {
+					this.closeWithError(workerWs, 'Usage limit reached.', {
+						errorType: 'UsageLimitReached',
+						message: 'Usage limit reached.',
+					});
+					return;
+				}
 				this.openAIClient.send(event.data);
 			}
 		});
@@ -104,8 +182,7 @@ export class ConversationDO extends DurableObject {
 			// await this.dumpConversationToArcane()
 			if (this.openAIClient && this.openAIClient.readyState === WebSocket.OPEN) {
 				console.log({ usageOpenAI: this.usageOpenAI, conversations: this.conversations });
-				console.log('[ConversationDO] Worker/Client closed the connection.');
-				this.openAIClient.close();
+				this.closeWithError(this.openAIClient, 'Worker/Client closed the connection.');
 			}
 		});
 	}
@@ -132,7 +209,16 @@ export class ConversationDO extends DurableObject {
 
 				switch (evt.type) {
 					case 'response.done':
-						this.usageOpenAI.push(evt.response.usage);
+						const { total_tokens, input_tokens, output_tokens } = evt.response.usage;
+						this.usageOpenAI = {
+							total_tokens: this.usageOpenAI.total_tokens + total_tokens,
+							input_tokens: this.usageOpenAI.input_tokens + input_tokens,
+							output_tokens: this.usageOpenAI.output_tokens + output_tokens,
+							cost: {
+								input: (this.usageOpenAI.input_tokens + input_tokens) * this.feature.costPerToken.input,
+								output: (this.usageOpenAI.output_tokens + output_tokens) * this.feature.costPerToken.output,
+							},
+						};
 						break;
 					case 'conversation.item.input_audio_transcription.completed':
 						this.conversations.push({
@@ -154,11 +240,25 @@ export class ConversationDO extends DurableObject {
 
 		openAIClient.addEventListener('close', () => {
 			if (this.workerSocket && this.workerSocket.readyState === WebSocket.OPEN) {
-				console.log('OpenAI server closed the connection.');
-				this.workerSocket.close();
+				this.closeWithError(this.workerSocket, 'OpenAI server closed the connection.');
 			}
 		});
 
 		return openAIClient;
+	}
+
+	closeWithError(
+		socket: WebSocket,
+		logMessage: string,
+		clientError?: {
+			errorType: string;
+			message: string;
+		}
+	) {
+		if (clientError) {
+			socket.send(JSON.stringify({ type: 'error', errorType: clientError.errorType, message: clientError.message }));
+		}
+		console.log(`[ConversationDO] ${logMessage}`);
+		socket.close();
 	}
 }
