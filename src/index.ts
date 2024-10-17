@@ -77,13 +77,14 @@ export class ConversationDO extends DurableObject {
 	}[] = [];
 	feature: TRealtimeVoiceChatFeature = {
 		usage: 0,
-		resetsAt: 2147452200000,
+		resetsAt: 0,
 		limit: 0,
 		costPerToken: {
-			input: 0.001,
-			output: 0.002,
+			input: 0.1,
+			output: 0.2,
 		},
 	};
+	accessToken: string = '';
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -95,6 +96,7 @@ export class ConversationDO extends DurableObject {
 		const [client, server] = Object.values(webSocketPair);
 
 		const accessToken = new URL(request.url).searchParams.get('token') || '';
+		this.accessToken = accessToken;
 		await this.handleSession(server, accessToken);
 
 		return new Response(null, {
@@ -109,7 +111,7 @@ export class ConversationDO extends DurableObject {
 
 		let clientError = { errorType: 'Unknown', message: 'Unexpected Error occured' };
 		try {
-			const verificationResponse = await fetch('http://localhost:8080/v1/user/realtime/user-verification', {
+			const usageResponse = await fetch('http://localhost:8080/v1/user/realtime/user-usage', {
 				method: 'GET',
 				headers: {
 					Authorization: `Bearer ${accessToken}`,
@@ -117,14 +119,14 @@ export class ConversationDO extends DurableObject {
 				},
 			});
 
-			const body: TApiResponse = await verificationResponse.json();
-			if (!verificationResponse.ok) {
+			const body: TApiResponse = await usageResponse.json();
+			if (!usageResponse.ok) {
 				if ('type' in body.data) {
 					clientError = { errorType: body.data.type, message: body.data.message };
 				}
 				const logMessage = `Error verifying user: ${JSON.stringify(body)}`;
 
-				this.sendErrorAndClose(workerWs, logMessage, clientError);
+				this.sendMessageAndClose(workerWs, logMessage, clientError);
 				return;
 			} else if ('realtimeVoiceChat' in body.data) {
 				this.feature = body.data.realtimeVoiceChat;
@@ -133,7 +135,7 @@ export class ConversationDO extends DurableObject {
 			this.openAIClient = this.connectToOpenAI();
 		} catch (error) {
 			const logMessage = `Error verifying user: ${JSON.stringify(error)}`;
-			this.sendErrorAndClose(workerWs, logMessage, clientError);
+			this.sendMessageAndClose(workerWs, logMessage, clientError);
 			return;
 		}
 
@@ -149,7 +151,7 @@ export class ConversationDO extends DurableObject {
 		}
 
 		if (this.isUsageLimitReached()) {
-			this.sendErrorAndClose(this.workerSocket!, 'Usage limit reached.', {
+			this.sendMessageAndClose(this.workerSocket!, 'Usage limit reached.', {
 				errorType: 'UsageLimitReached',
 				message: 'Usage limit reached.',
 			});
@@ -160,10 +162,9 @@ export class ConversationDO extends DurableObject {
 	}
 
 	handleWorkerClose() {
-		// await this.dumpConversationToArcane()
 		if (this.openAIClient && this.openAIClient.readyState === WebSocket.OPEN) {
 			console.log({ usageOpenAI: this.usageOpenAI, conversations: this.conversations });
-			this.sendErrorAndClose(this.openAIClient, 'Worker/Client closed the connection.');
+			this.sendMessageAndClose(this.openAIClient, 'Worker/Client closed the connection.');
 		}
 	}
 
@@ -217,7 +218,7 @@ export class ConversationDO extends DurableObject {
 
 	handleOpenAIClose() {
 		if (this.workerSocket && this.workerSocket.readyState === WebSocket.OPEN) {
-			this.sendErrorAndClose(this.workerSocket, 'OpenAI server closed the connection.');
+			this.sendMessageAndClose(this.workerSocket, 'OpenAI server closed the connection.');
 		}
 	}
 
@@ -227,8 +228,8 @@ export class ConversationDO extends DurableObject {
 			input_tokens: this.usageOpenAI.input_tokens + input_tokens,
 			output_tokens: this.usageOpenAI.output_tokens + output_tokens,
 			cost: {
-				input: (this.usageOpenAI.input_tokens + input_tokens) * this.feature.costPerToken.input,
-				output: (this.usageOpenAI.output_tokens + output_tokens) * this.feature.costPerToken.output,
+				input: (this.usageOpenAI.input_tokens + input_tokens) * (this.feature.costPerToken.input / 1000),
+				output: (this.usageOpenAI.output_tokens + output_tokens) * (this.feature.costPerToken.output / 1000),
 			},
 		};
 	}
@@ -237,7 +238,43 @@ export class ConversationDO extends DurableObject {
 		return this.usageOpenAI.cost.input + this.usageOpenAI.cost.output + this.feature.usage >= this.feature.limit;
 	}
 
-	sendErrorAndClose(
+	async dumpUsageToArcane() {
+		if (this.usageOpenAI.total_tokens === 0) return;
+
+		try {
+			const res = await fetch('http://localhost:8080/v1/user/realtime/update-usage', {
+				method: 'POST',
+				headers: {
+					Authorization: `Bearer ${this.accessToken}`,
+					'x-merlin-version': 'socket-merlin',
+					Accept: 'application/json',
+					'Content-Type': 'application/json',
+				},
+				body: JSON.stringify({
+					input_tokens: this.usageOpenAI.input_tokens,
+					output_tokens: this.usageOpenAI.output_tokens,
+				}),
+			});
+
+			if (res.ok) {
+				console.log(`[ConversationDO] Usage updated to Arcane:`, this.usageOpenAI);
+				// Reset usage
+				this.usageOpenAI = {
+					total_tokens: 0,
+					input_tokens: 0,
+					output_tokens: 0,
+					cost: {
+						input: 0,
+						output: 0,
+					},
+				};
+			}
+		} catch (error) {
+			console.log(`[ConversationDO] Error updating usage to Arcane: ${JSON.stringify(error)}`);
+		}
+	}
+
+	sendMessageAndClose(
 		socket: WebSocket,
 		logMessage: string,
 		clientError?: {
@@ -249,6 +286,8 @@ export class ConversationDO extends DurableObject {
 			socket.send(JSON.stringify({ type: 'error', errorType: clientError.errorType, message: clientError.message }));
 		}
 		console.log(`[ConversationDO] ${logMessage}`);
+		this.dumpUsageToArcane().catch(console.log);
+		// await this.dumpConversationToArcane()
 		socket.close();
 	}
 }
