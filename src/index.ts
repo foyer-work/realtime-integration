@@ -257,7 +257,7 @@ export class ConversationDO extends DurableObject {
 			});
 
 			if (res.ok) {
-				console.log(`[ConversationDO] Usage updated to Arcane:`, this.usageOpenAI);
+				console.log(`[ConversationDO] Usage updated to Arcane: ${this.usageOpenAI}`);
 				// Reset usage
 				this.usageOpenAI = {
 					total_tokens: 0,
