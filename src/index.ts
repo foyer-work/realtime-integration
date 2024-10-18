@@ -111,7 +111,7 @@ export class ConversationDO extends DurableObject {
 
 		let clientError = { errorType: 'Unknown', message: 'Unexpected Error occured' };
 		try {
-			const usageResponse = await fetch('http://localhost:8080/v1/user/realtime/user-usage', {
+			const usageResponse = await fetch('https://arcane-realtime-yak3s7dv3a-uw.a.run.app/v1/user/realtime/user-usage', {
 				method: 'GET',
 				headers: {
 					Authorization: `Bearer ${accessToken}`,
@@ -242,7 +242,7 @@ export class ConversationDO extends DurableObject {
 		if (this.usageOpenAI.total_tokens === 0) return;
 
 		try {
-			const res = await fetch('http://localhost:8080/v1/user/realtime/update-usage', {
+			const res = await fetch('https://arcane-realtime-yak3s7dv3a-uw.a.run.app/v1/user/realtime/update-usage', {
 				method: 'POST',
 				headers: {
 					Authorization: `Bearer ${this.accessToken}`,
